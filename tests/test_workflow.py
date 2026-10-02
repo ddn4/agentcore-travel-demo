@@ -1,5 +1,6 @@
 import uuid
 from collections import Counter
+from decimal import Decimal
 
 import pytest
 from temporalio import activity
@@ -11,7 +12,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 from tests.mock_model import MockModel, reply
-from travel.models import ChatRequest, ConciergeInput
+from travel.models import ChatRequest, ConciergeInput, LineItem, PricedTrip, PriceRequest
 from travel.workflow import ConciergeWorkflow
 
 TASK_QUEUE = "test-concierge"
@@ -40,7 +41,26 @@ async def mock_search_places(city: str, interests: list[str]) -> list[dict]:
     return [{"place_id": "ChIJmuseum", "name": "Museu Nacional do Azulejo", "category": "museum", "mock_price": "18"}]
 
 
-MOCK_ACTIVITIES = [mock_search_flights, mock_search_hotels, mock_search_places]
+# What the providers charge in these tests. The model never sees or supplies these amounts.
+PRICES = {"off_fake_zz": Decimal("412.30"), "rat_fake_1": Decimal("465.00"),
+          "ChIJmuseum": Decimal("18"), "ChIJfado": Decimal("55")}
+PROPOSAL = {"destination": "Lisbon", "start_date": "2027-03-10", "end_date": "2027-03-13", "travelers": 1,
+            "budget_usd": 3000, "flight_offer_id": "off_fake_zz", "hotel_rate_id": "rat_fake_1",
+            "activity_place_ids": ["ChIJmuseum", "ChIJfado"], "itinerary": ["Day 1: Alfama"]}
+
+
+@activity.defn(name="price_quote")
+async def mock_price_quote(req: PriceRequest) -> PricedTrip:
+    CALLS["price_quote"] += 1
+    p = req.proposal
+    kinds = [("flight", p.flight_offer_id), ("hotel", p.hotel_rate_id)] + [("activity", a) for a in p.activity_place_ids]
+    items = [LineItem(kind=k, item_id=i, book_id=i, label=i, amount=PRICES[i], currency="USD", mock=k == "activity")
+             for k, i in kinds]
+    return PricedTrip(line_items=items, totals={"USD": sum(i.amount for i in items)},
+                      expires_at="2099-01-01T00:00:00Z")
+
+
+MOCK_ACTIVITIES = [mock_search_flights, mock_search_hotels, mock_search_places, mock_price_quote]
 
 
 @pytest.fixture(scope="session")
@@ -144,3 +164,22 @@ async def test_agents_as_tools_wiring(env: WorkflowEnvironment):
         await handle.result()
 
     await Replayer(workflows=[ConciergeWorkflow], plugins=[plugin]).replay_workflow(await handle.fetch_history())
+
+
+async def test_proposal_is_priced_by_activity(env: WorkflowEnvironment):
+    client, _ = connect(env, [reply("Here is your Lisbon trip.", PROPOSAL)])
+    conv_id = f"concierge-{uuid.uuid4()}"
+    async with worker(client):
+        response, handle = await chat(client, conv_id, "Plan a four-day trip from New York to Lisbon in March")
+        quote = response.quote
+        assert quote is not None and quote.quote_id == "q1"
+        assert quote.totals == {"USD": Decimal("950.30")}  # every amount comes from price_quote, none from the model
+        assert [i.amount for i in quote.line_items] == [PRICES[i] for i in
+                                                        ("off_fake_zz", "rat_fake_1", "ChIJmuseum", "ChIJfado")]
+        assert quote.over_budget is False
+        assert quote.travellers == ["Ada Lovelace"]
+        assert [i.mock for i in quote.line_items] == [False, False, True, True]
+        assert response.status == "chatting"  # quotes are not approvable until v4
+        assert CALLS == Counter({"price_quote": 1})
+        await handle.signal(ConciergeWorkflow.end_chat)
+        await handle.result()
