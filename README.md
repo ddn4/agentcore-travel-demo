@@ -21,6 +21,28 @@ Amazon Bedrock AgentCore Runtime.
 uv sync
 ```
 
+## Run locally
+
+```bash
+# terminal 1: Temporal dev server (UI at http://localhost:8233)
+temporal server start-dev
+
+# terminal 2: the worker (needs AWS credentials with Bedrock access)
+export AWS_REGION=us-west-2 AWS_PROFILE=<profile>
+uv run python -m travel.worker
+
+# terminal 3: once per build id, after the worker has started polling
+temporal worker deployment set-current-version --deployment-name travel-concierge --build-id local --yes
+uv run python chat.py
+```
+
+The worker uses Worker Versioning even locally, for parity with AgentCore; that is why the
+`set-current-version` step exists. After switching tags, start a new conversation: open
+conversations are pinned to the code that started them.
+
+Tests run against a local dev server that the test fixture starts, with a scripted model, so they
+need no AWS credentials: `uv run pytest -q`.
+
 ## Walkthrough
 
 The repository is built one capability at a time. Each tag below runs and passes its tests;
@@ -29,3 +51,4 @@ The repository is built one capability at a time. Each tag below runs and passes
 | Tag | What you see | Command |
 |---|---|---|
 | `v0-spec` | the spec and a toolchain that installs | `uv sync` |
+| `v1-durable-chat` | a chat reply that survives a worker restart; `invoke_model` activities in the UI | `uv run python -m travel.worker` · `uv run python chat.py` |
