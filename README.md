@@ -13,7 +13,9 @@ Amazon Bedrock AgentCore Runtime.
 
 - Python 3.12 and [uv](https://docs.astral.sh/uv/)
 - [Temporal CLI](https://docs.temporal.io/cli) 1.8.3 or later
-- AWS credentials with Amazon Bedrock access to an Anthropic Claude model (default `global.anthropic.claude-sonnet-4-6`)
+- AWS credentials (any standard source: `aws login`, `aws sso login`, a profile, or env vars) that can call
+  Amazon Bedrock with an Anthropic Claude model (default `global.anthropic.claude-sonnet-4-6`).
+  Only the worker needs them; the chat client and the tests do not.
 - From `v2-agents-as-tools`: a Duffel **test** token and a Google Places API (New) key (see SPEC §8.3)
 - From `v7-agentcore`: AWS CLI v2, Node 20+ with `@aws/agentcore`, CDK bootstrapped, and a Temporal Cloud namespace enabled for Serverless Workers
 
@@ -24,17 +26,23 @@ uv sync
 ## Run locally
 
 ```bash
-# terminal 1: Temporal dev server (UI at http://localhost:8233)
+# terminal 1: Temporal dev server, with the Temporal Web UI at http://localhost:8233
 temporal server start-dev
 
-# terminal 2: the worker (needs AWS credentials with Bedrock access)
-export AWS_REGION=us-west-2 AWS_PROFILE=<profile>
+# terminal 2: the worker, in a shell with AWS credentials (set AWS_PROFILE if they are not the default profile)
 uv run python -m travel.worker
 
 # terminal 3: once per build id, after the worker has started polling
 temporal worker deployment set-current-version --deployment-name travel-concierge --build-id local --yes
 uv run python chat.py
 ```
+
+The chat is a plain terminal prompt (`you>` / `concierge>`). The Temporal Web UI is where you watch
+what happens underneath: each conversation is a workflow whose history shows every `chat` Update and
+every `invoke_model` activity.
+
+The region is `AWS_REGION` if set, else your AWS profile's region, else `us-east-1`. Override the
+model with `MODEL_ID` (for example `us.anthropic.claude-sonnet-4-6` where the global profile is blocked).
 
 The worker uses Worker Versioning even locally, for parity with AgentCore; that is why the
 `set-current-version` step exists. After switching tags, start a new conversation: open
