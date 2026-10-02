@@ -1342,6 +1342,7 @@ async def _find(lookup, wait_s: int):                        # poll a provider l
 ```python
 import asyncio, os
 from datetime import timedelta
+import boto3
 from botocore.config import Config as BotocoreConfig
 from strands.models.bedrock import BedrockModel
 from temporalio.client import Client
@@ -1358,10 +1359,13 @@ BUILD_ID   = os.environ.get("TEMPORAL_BUILD_ID", "local")      # AgentCore shell
 
 _NO_RETRY = BotocoreConfig(retries={"max_attempts": 0}, read_timeout=120)   # Temporal owns retries
 
+def aws_region() -> str:
+    """AWS_REGION, else the region of the active AWS profile, else us-east-1."""
+    return os.environ.get("AWS_REGION") or boto3.Session().region_name or "us-east-1"
+
 def bedrock_models() -> dict:
-    region = os.environ.get("AWS_REGION", "us-west-2")
     model_id = os.environ.get("MODEL_ID", "global.anthropic.claude-sonnet-4-6")   # Strands' default model
-    make = lambda: BedrockModel(model_id=model_id, region_name=region, boto_client_config=_NO_RETRY)
+    make = lambda: BedrockModel(model_id=model_id, region_name=aws_region(), boto_client_config=_NO_RETRY)
     return {"concierge": make, "specialist": make}       # lazy factories; never invoked by chat.py
 
 async def connect(models: dict | None = None) -> Client:
@@ -1470,7 +1474,7 @@ uv sync
 temporal server start-dev                       # UI http://localhost:8233
 
 # terminal 2 — worker (needs AWS creds with Bedrock access to the Anthropic model)
-export AWS_REGION=us-west-2 AWS_PROFILE=<profile>
+export AWS_PROFILE=<profile>          # or `aws login`; region: AWS_REGION, else the profile's, else us-east-1
 export DUFFEL_ACCESS_TOKEN=duffel_test_... GOOGLE_PLACES_API_KEY=...
 uv run python -m travel.worker
 
@@ -1494,13 +1498,13 @@ curl -X POST localhost:8080/invocations -H 'Content-Type: application/json' -d '
 
 | Var | Local default | AgentCore |
 |---|---|---|
-| `TEMPORAL_ADDRESS` | unset → `localhost:7233` | `<ns>.<acct>.tmprl.cloud:7233` (if the namespace has both mTLS and API-key auth, use the regional endpoint `us-west-2.aws.api.temporal.io:7233`) |
+| `TEMPORAL_ADDRESS` | unset → `localhost:7233` | `<ns>.<acct>.tmprl.cloud:7233` (if the namespace has both mTLS and API-key auth, use the regional endpoint `us-east-1.aws.api.temporal.io:7233`) |
 | `TEMPORAL_NAMESPACE` | unset → `default` | `<ns>.<acct>` |
 | `TEMPORAL_API_KEY` | unset (no TLS) | API key; turns TLS on automatically |
 | `TEMPORAL_TASK_QUEUE` | `travel-concierge` | `travel-concierge` |
 | `TEMPORAL_DEPLOYMENT_NAME` | `travel-concierge` | `travel-concierge` (required) |
 | `TEMPORAL_BUILD_ID` | `local` | `1.0.0`, bumped every deploy (required) |
-| `AWS_REGION` | `us-west-2` | `us-west-2` |
+| `AWS_REGION` | unset → the AWS profile's region → `us-east-1` | `us-east-1` |
 | `MODEL_ID` | `global.anthropic.claude-sonnet-4-6` | same |
 | `AGENTCORE_DEBOUNCE_SECONDS` | n/a | `300` for live demos (sample default 60) |
 | `DUFFEL_ACCESS_TOKEN` | `duffel_test_…` (required by the worker; any other prefix is refused) | same test token |
@@ -1594,7 +1598,7 @@ The sample's file with our values. **Endpoint names: one per build**, and they m
       {"name": "TEMPORAL_TASK_QUEUE",       "value": "travel-concierge"},
       {"name": "TEMPORAL_DEPLOYMENT_NAME",  "value": "travel-concierge"},
       {"name": "TEMPORAL_BUILD_ID",         "value": "1.0.0"},
-      {"name": "AWS_REGION",                "value": "us-west-2"},
+      {"name": "AWS_REGION",                "value": "us-east-1"},
       {"name": "MODEL_ID",                  "value": "global.anthropic.claude-sonnet-4-6"},
       {"name": "AGENTCORE_DEBOUNCE_SECONDS","value": "300"},
       {"name": "DUFFEL_ACCESS_TOKEN",       "value": "duffel_test_<token>"},
@@ -1606,7 +1610,7 @@ The sample's file with our values. **Endpoint names: one per build**, and they m
   "memories": [], "knowledgeBases": [], "credentials": [] }
 ```
 - This is the file as committed at v7. v8 bumps the build id to `1.1.0` and adds the `b1_1_0` endpoint next to `b1_0_0` (§9.4).
-- `aws-targets.json`: `[{"name":"default","account":"<id>","region":"us-west-2"}]`.
+- `aws-targets.json`: `[{"name":"default","account":"<id>","region":"us-east-1"}]`.
 - **Keys:** `TEMPORAL_API_KEY`, `DUFFEL_ACCESS_TOKEN` and `GOOGLE_PLACES_API_KEY` all go in `envVars`, exactly as the sample does for the Temporal key. Secrets Manager stays a non-goal. Fill them in locally, and **do not commit the populated values**. Changing any of them creates a new runtime version (§9.4). For production, load it from Secrets Manager in the entrypoint (https://docs.temporal.io/production-deployment/worker-deployments/serverless-workers/agentcore#configure-worker-runtime).
 - **Execution role:** created by `agentcore deploy`; the sample needs no extra policy for Bedrock model calls (its only `additionalPolicies` entry is Code Interpreter, which we don't use). If Bedrock calls are denied, see §12 Q6.
 - `idleRuntimeSessionTimeout: 120` (range 60–28800): while the async task is registered `/ping` is HealthyBusy regardless of the idle timer; after drain nothing runs, so a short idle timeout is fine (sample README).
@@ -1615,7 +1619,7 @@ The sample's file with our values. **Endpoint names: one per build**, and they m
 ```bash
 # 0. Prereqs: Bedrock Anthropic model access + Duffel/Google keys confirmed by a local run (§8.3);
 #    keys filled into agentcore.json envVars (not committed); CDK bootstrapped; uv on PATH
-export AWS_REGION=us-west-2
+export AWS_REGION=us-east-1
 # 1. Scaffold (first run) + agentcore validate + agentcore deploy — the script does all three
 ./bin/create-runtime.sh
 # 2. Capture ARNs (runtime name = <project>_<runtime>)
@@ -1835,7 +1839,7 @@ One smoke test of the real providers. It drives the activities directly with `te
 
 ### E. The same code on AgentCore
 1. Use the same CLI with `TEMPORAL_*` pointing at Cloud. `git diff --stat v6-long-conversations v7-agentcore -- travel/` and `git diff --stat v7-agentcore v8-versioned-redeploy -- travel/` are both empty: only env vars and the `agentcore/agentcore.json` env values differ. Don't show that file's diff, because it holds the keys.
-2. The first message makes the WCI invoke the runtime ("worker starting" in `agentcore logs`). The worker calls Duffel and Google over PUBLIC egress, and the workflow history looks identical to local. The permission prompt still appears on the laptop, and the located city is the **laptop's**, not us-west-2's: the worker only geolocates the IP the client sent.
+2. The first message makes the WCI invoke the runtime ("worker starting" in `agentcore logs`). The worker calls Duffel and Google over PUBLIC egress, and the workflow history looks identical to local. The permission prompt still appears on the laptop, and the located city is the **laptop's**, not the AWS region's: the worker only geolocates the IP the client sent.
 3. Leave the approval pending for longer than `AGENTCORE_DEBOUNCE_SECONDS`. The logs show the worker draining (scale to zero).
 4. `/approve` → the runtime is invoked again (the CLI may print "waiting for a worker…"). The workflow replays, the re-check runs, and the saga completes. A flight offer that expired while the worker was scaled to zero takes the D3 path instead.
 
@@ -1864,8 +1868,8 @@ One smoke test of the real providers. It drives the activities directly with `te
 5. **AgentCore Pre-release access** for the namespace. The UI and CLI flags may change.
 6. **Bedrock permissions of the auto-created execution role.** The sample relies on them (default `BedrockModel()`, no extra policy). If calls are denied:
    - Add a root-level `bedrock-policy.json` to `additionalPolicies`, allowing `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on:
-     - `arn:aws:bedrock:us-west-2:<acct>:inference-profile/global.anthropic.*`
-     - `arn:aws:bedrock:us-west-2::foundation-model/anthropic.*`
+     - `arn:aws:bedrock:us-east-1:<acct>:inference-profile/global.anthropic.*`
+     - `arn:aws:bedrock:us-east-1::foundation-model/anthropic.*`
      - `arn:aws:bedrock:::foundation-model/anthropic.*` (global cross-region inference)
    - An org region-deny SCP must allow `aws:RequestedRegion = unspecified`.
 7. **Model availability.** `global.anthropic.claude-sonnet-4-6` is Strands' default, and access is per account and region. `claude-sonnet-5-5` is untested with the plugin. Haiku 4.5 is in its EOL window.
@@ -1917,6 +1921,8 @@ One smoke test of the real providers. It drives the activities directly with `te
     - UNVERIFIED with real Bedrock: that Sonnet calls `locate_user` before asking for an origin, and calls it only once. Extra calls cost one silent IP round trip each.
     - Accepted: the model sees an `ip` parameter in the tool spec, and the hook ignores it.
 21. **Forcing continue-as-new in tests.** `test_continue_as_new_keeps_conversation` starts the dev server with `dev_server_extra_args=["--dynamic-config-value", "limit.historyCount.suggestContinueAsNew=50"]`. UNVERIFIED: the key name and that the dev server honours it. Fallback: a test-only `ConciergeInput.max_turns_per_run: int | None = None` that also makes `_should_continue_as_new` true. It is one line, but it adds a field to production input, so it's used only if the dynamic config fails.
+
+22. **Region.** The default region is `us-east-1` (locally: `AWS_REGION`, else the AWS profile's region, else `us-east-1`). Claude Sonnet 4.6 and the `global.` inference profile are available there. UNVERIFIED: that Temporal Cloud Serverless Workers on AgentCore (pre-release) support `us-east-1`; confirm before v7, and keep the AgentCore region close to the Temporal Cloud namespace's region.
 
 ### Key references
 - Strands plugin: https://docs.temporal.io/develop/python/integrations/strands-agents · https://github.com/temporalio/sdk-python/tree/main/temporalio/contrib/strands · https://python.temporal.io/temporalio.contrib.strands.TemporalAgent.html
