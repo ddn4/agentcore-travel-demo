@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 from datetime import timedelta
 from decimal import Decimal
 
@@ -49,7 +50,9 @@ class ConciergeWorkflow:
                 result = await self._concierge.invoke_async(text, structured_output_model=ConciergeReply)
                 reply: ConciergeReply = result.structured_output or ConciergeReply(message=str(result).strip())
                 priced = None
-                if reply.proposal:  # the model proposed offer IDs; the providers price them
+                if reply.proposal and (invented := self._invented_ids(reply.proposal)):
+                    priced = PricedTrip(problems=[f"{i} was not returned by any search" for i in invented])
+                elif reply.proposal:  # the model proposed offer IDs; the providers price them
                     priced = await workflow.execute_activity(
                         act.price_quote, PriceRequest(proposal=reply.proposal), summary="price_quote", **PRICE)
             except (ActivityError, EventLoopException, StructuredOutputException) as e:
@@ -69,6 +72,12 @@ class ConciergeWorkflow:
                 else:
                     self._quote = self._make_quote(reply.proposal, priced)
             return ChatResponse(message=message, status=self._status, quote=self._quote)
+
+    def _invented_ids(self, p: TripProposal) -> list[str]:
+        """Proposed IDs that appear in no tool result the concierge received: the model may not invent offers."""
+        results = json.dumps([block["toolResult"]["content"] for m in self._concierge.messages
+                              for block in m["content"] if "toolResult" in block])
+        return [i for i in (p.flight_offer_id, p.hotel_rate_id, *p.activity_place_ids) if i not in results]
 
     def _make_quote(self, p: TripProposal, priced: PricedTrip) -> Quote:
         """Amounts come from price_quote (providers and the mock rate card), never from the model."""

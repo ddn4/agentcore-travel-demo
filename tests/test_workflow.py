@@ -38,7 +38,8 @@ async def mock_search_hotels(city: str, check_in: str, check_out: str, travelers
 @activity.defn(name="search_places")
 async def mock_search_places(city: str, interests: list[str]) -> list[dict]:
     CALLS["search_places"] += 1
-    return [{"place_id": "ChIJmuseum", "name": "Museu Nacional do Azulejo", "category": "museum", "mock_price": "18"}]
+    return [{"place_id": "ChIJmuseum", "name": "Museu Nacional do Azulejo", "category": "museum", "mock_price": "18"},
+            {"place_id": "ChIJfado", "name": "Clube de Fado", "category": "restaurant", "mock_price": "55"}]
 
 
 # What the providers charge in these tests. The model never sees or supplies these amounts.
@@ -55,9 +56,10 @@ async def mock_price_quote(req: PriceRequest) -> PricedTrip:
     p = req.proposal
     kinds = [("flight", p.flight_offer_id), ("hotel", p.hotel_rate_id)] + [("activity", a) for a in p.activity_place_ids]
     items = [LineItem(kind=k, item_id=i, book_id=i, label=i, amount=PRICES[i], currency="USD", mock=k == "activity")
-             for k, i in kinds]
+             for k, i in kinds if i in PRICES]
+    problems = [f"{k} {i} unavailable" for k, i in kinds if i not in PRICES]  # like the real one: data, not errors
     return PricedTrip(line_items=items, totals={"USD": sum(i.amount for i in items)},
-                      expires_at="2099-01-01T00:00:00Z")
+                      expires_at="2099-01-01T00:00:00Z", problems=problems)
 
 
 MOCK_ACTIVITIES = [mock_search_flights, mock_search_hotels, mock_search_places, mock_price_quote]
@@ -166,8 +168,16 @@ async def test_agents_as_tools_wiring(env: WorkflowEnvironment):
     await Replayer(workflows=[ConciergeWorkflow], plugins=[plugin]).replay_workflow(await handle.fetch_history())
 
 
+# One scripted search round: the concierge asks each specialist, and each answers with the IDs it "found".
+SEARCHES = [{"name": "flight_agent", "input": {"input": "JFK to Lisbon, 2027-03-10 to 2027-03-13"}},
+            {"name": "hotel_agent", "input": {"input": "Lisbon, 2027-03-10 to 2027-03-13"}},
+            {"name": "itinerary_agent", "input": {"input": "Lisbon, museums and fado"}}]
+FOUND = ['[{"offer_id": "off_fake_zz"}]', '[{"rate_id": "rat_fake_1"}]',
+         '{"places": [{"place_id": "ChIJmuseum"}, {"place_id": "ChIJfado"}]}']
+
+
 async def test_proposal_is_priced_by_activity(env: WorkflowEnvironment):
-    client, _ = connect(env, [reply("Here is your Lisbon trip.", PROPOSAL)])
+    client, _ = connect(env, [*SEARCHES, reply("Here is your Lisbon trip.", PROPOSAL)], FOUND)
     conv_id = f"concierge-{uuid.uuid4()}"
     async with worker(client):
         response, handle = await chat(client, conv_id, "Plan a four-day trip from New York to Lisbon in March")
@@ -181,5 +191,24 @@ async def test_proposal_is_priced_by_activity(env: WorkflowEnvironment):
         assert [i.mock for i in quote.line_items] == [False, False, True, True]
         assert response.status == "chatting"  # quotes are not approvable until v4
         assert CALLS == Counter({"price_quote": 1})
+        await handle.signal(ConciergeWorkflow.end_chat)
+        await handle.result()
+
+
+async def test_invented_ids_are_rejected(env: WorkflowEnvironment):
+    concierge = [reply("Here is your Lisbon trip.", PROPOSAL),  # proposes without searching: every ID is invented
+                 reply("Sorry, let me search properly.")]
+    model = MockModel(concierge)
+    client = Client(**{**env.client.config(), "plugins": [StrandsPlugin(models={"concierge": lambda: model})]})
+    conv_id = f"concierge-{uuid.uuid4()}"
+    async with worker(client):
+        response, handle = await chat(client, conv_id, "Plan a trip to Lisbon in March")
+        assert response.quote is None
+        assert "off_fake_zz was not returned by any search" in response.message
+        assert CALLS["price_quote"] == 0  # never priced
+        await chat(client, conv_id, "ok")  # the concierge is told on its next turn
+        last_user_text = model.seen[-1][-1]["content"][0]["text"]
+        assert last_user_text.startswith("[system: price_quote rejected the proposal: off_fake_zz was not returned")
+        assert (await scheduled(handle))["price_quote"] == 0
         await handle.signal(ConciergeWorkflow.end_chat)
         await handle.result()
