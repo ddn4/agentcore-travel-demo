@@ -50,8 +50,29 @@ the worker starts), wait a few seconds and run it again. Until it succeeds, chat
 without a reply; they go through as soon as the version is current. After switching tags, start a new conversation: open
 conversations are pinned to the code that started them.
 
-Tests run against a local dev server that the test fixture starts, with a scripted model, so they
-need no AWS credentials: `uv run pytest -q`.
+Tests run against a local dev server that the test fixture starts, with a scripted model and mocked
+providers, so they need no AWS credentials or provider keys: `uv run pytest -q`.
+
+## Provider accounts (from `v2-agents-as-tools`)
+
+Flights and hotels are real Duffel **test-mode** offers; things to do are real Google places. Only the
+worker needs these keys.
+
+1. **Duffel**: sign up at duffel.com and **request Duffel Stays access** (contact form; it can take a
+   while, so do it first). Create a **test** access token (`duffel_test_...`). The worker refuses any other kind.
+2. **Google**: in a Cloud project with billing enabled, enable **Places API (New)** and create an API key
+   restricted to it. The demo only requests Pro-SKU fields, which stay within the monthly free usage.
+
+```bash
+# in the worker's terminal, before uv run python -m travel.worker
+export DUFFEL_ACCESS_TOKEN=duffel_test_...
+export GOOGLE_PLACES_API_KEY=...
+# optional: DUFFEL_TEST_HOTEL=1 always uses Duffel's documented test hotel
+```
+
+Smoke-test the real providers without an LLM or a workflow: `uv run pytest -m live -q -s`.
+Activity prices come from a mock rate card and are labelled "(mock price)"; everything else in a
+quote is what Duffel returned.
 
 ## Walkthrough
 
@@ -69,3 +90,4 @@ git diff v0-spec..v1-durable-chat       # what that step added (or use the Relea
 |---|---|---|
 | [`v0-spec`](https://github.com/ddn4/agentcore-travel-demo/releases/tag/v0-spec) | the spec and a toolchain that installs | `uv sync` |
 | [`v1-durable-chat`](https://github.com/ddn4/agentcore-travel-demo/releases/tag/v1-durable-chat) | a chat reply that survives a worker restart; `invoke_model` activities in the UI | `uv run python -m travel.worker` · `uv run python chat.py` |
+| [`v2-agents-as-tools`](https://github.com/ddn4/agentcore-travel-demo/releases/tag/v2-agents-as-tools) | the concierge calling flight, hotel, itinerary and budget agents as tools; a quote priced by `price_quote` from real Duffel and Google data | `chat.py` → "Plan a four-day trip from New York to Lisbon in March under $3K" |

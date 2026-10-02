@@ -12,9 +12,25 @@ from temporalio.client import (
 )
 from temporalio.common import WorkflowIDConflictPolicy
 
-from travel.models import ChatRequest, ChatResponse, ConciergeInput
+from travel.models import ChatRequest, ChatResponse, ConciergeInput, Quote
 from travel.worker import TASK_QUEUE, connect
 from travel.workflow import ConciergeWorkflow
+
+def show_quote(q: Quote) -> None:
+    """The provider-priced quote: every amount here came from price_quote, not from the model."""
+    print(f"\n  quote {q.quote_id}  ({', '.join(q.travellers)}, test profiles)")
+    for i in q.line_items:
+        print(f"    {i.kind:<8} {i.label:<60} {i.amount:>10} {i.currency}")
+    for currency, total in q.totals.items():
+        print(f"    {'total':<8} {'':<60} {total:>10} {currency}")
+    if q.over_budget:
+        print("    over budget")
+    elif q.over_budget is None and q.proposal.budget_usd is not None:
+        print("    budget not compared (not every price is in USD)")
+    if q.expires_at:
+        print(f"    flight offer expires {q.expires_at}")
+    print()
+
 
 HELP = "Type a message, /status, or /quit (ends the conversation). Ctrl+C leaves it open to resume later."
 
@@ -30,6 +46,7 @@ def main() -> None:
         client = runner.run(connect())  # Bedrock factories are lazy; the CLI never builds a model
         conv_id = args.conversation or f"concierge-{uuid.uuid4()}"
         handle = client.get_workflow_handle_for(ConciergeWorkflow.run, conv_id)
+        shown_quote: str | None = None
         print(f"conversation {conv_id}\n{HELP}")
 
         async def send(text: str) -> ChatResponse:
@@ -86,6 +103,9 @@ def main() -> None:
                     print(f"(not sent: {e.cause})")
                     continue
                 print(f"concierge> {reply.message}")
+                if reply.quote and reply.quote.quote_id != shown_quote:
+                    show_quote(reply.quote)
+                    shown_quote = reply.quote.quote_id
         except KeyboardInterrupt:  # leave without ending the conversation: it is durable
             print(f"\n(left conversation {conv_id} open; resume with: uv run python chat.py --conversation {conv_id})")
 

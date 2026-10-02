@@ -1,18 +1,68 @@
 import uuid
+from collections import Counter
+from decimal import Decimal
 
 import pytest
+from temporalio import activity
 from temporalio.api.enums.v1 import EventType
-from temporalio.client import Client, WithStartWorkflowOperation, WorkflowUpdateFailedError
+from temporalio.client import Client, WithStartWorkflowOperation, WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.common import WorkflowIDConflictPolicy
 from temporalio.contrib.strands import StrandsPlugin
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
-from tests.mock_model import MockModel
-from travel.models import ChatRequest, ConciergeInput
+from tests.mock_model import MockModel, reply
+from travel.models import ChatRequest, ConciergeInput, LineItem, PricedTrip, PriceRequest
 from travel.workflow import ConciergeWorkflow
 
 TASK_QUEUE = "test-concierge"
+CALLS: Counter = Counter()  # mocked activity name -> times called
+
+
+# --- mocked provider activities, registered under the real names (no network) ---
+@activity.defn(name="search_flights")
+async def mock_search_flights(origin: str, destination: str, depart_date: str, return_date: str,
+                              travelers: int = 1, cabin_class: str = "economy") -> list[dict]:
+    CALLS["search_flights"] += 1
+    return [{"offer_id": "off_fake_zz", "airline": "Duffel Airways", "total_amount": "412.30", "currency": "USD",
+             "outbound": "JFK → LIS", "inbound": "LIS → JFK", "red_eye": False}]
+
+
+@activity.defn(name="search_hotels")
+async def mock_search_hotels(city: str, check_in: str, check_out: str, travelers: int = 1) -> list[dict]:
+    CALLS["search_hotels"] += 1
+    return [{"rate_id": "rat_fake_1", "hotel": "Memmo Alfama", "nightly": "155.00", "total_amount": "465.00",
+             "currency": "USD", "test_fallback": False}]
+
+
+@activity.defn(name="search_places")
+async def mock_search_places(city: str, interests: list[str]) -> list[dict]:
+    CALLS["search_places"] += 1
+    return [{"place_id": "ChIJmuseum", "name": "Museu Nacional do Azulejo", "category": "museum", "mock_price": "18"},
+            {"place_id": "ChIJfado", "name": "Clube de Fado", "category": "restaurant", "mock_price": "55"}]
+
+
+# What the providers charge in these tests. The model never sees or supplies these amounts.
+PRICES = {"off_fake_zz": Decimal("412.30"), "rat_fake_1": Decimal("465.00"),
+          "ChIJmuseum": Decimal("18"), "ChIJfado": Decimal("55")}
+PROPOSAL = {"destination": "Lisbon", "start_date": "2027-03-10", "end_date": "2027-03-13", "travelers": 1,
+            "budget_usd": 3000, "flight_offer_id": "off_fake_zz", "hotel_rate_id": "rat_fake_1",
+            "activity_place_ids": ["ChIJmuseum", "ChIJfado"], "itinerary": ["Day 1: Alfama"]}
+
+
+@activity.defn(name="price_quote")
+async def mock_price_quote(req: PriceRequest) -> PricedTrip:
+    CALLS["price_quote"] += 1
+    p = req.proposal
+    kinds = [("flight", p.flight_offer_id), ("hotel", p.hotel_rate_id)] + [("activity", a) for a in p.activity_place_ids]
+    items = [LineItem(kind=k, item_id=i, book_id=i, label=i, amount=PRICES[i], currency="USD", mock=k == "activity")
+             for k, i in kinds if i in PRICES]
+    problems = [f"{k} {i} unavailable" for k, i in kinds if i not in PRICES]  # like the real one: data, not errors
+    return PricedTrip(line_items=items, totals={"USD": sum(i.amount for i in items)},
+                      expires_at="2099-01-01T00:00:00Z", problems=problems)
+
+
+MOCK_ACTIVITIES = [mock_search_flights, mock_search_hotels, mock_search_places, mock_price_quote]
 
 
 @pytest.fixture(scope="session")
@@ -21,8 +71,20 @@ async def env():
         yield env
 
 
-def plugin_for(concierge_script: list[str]) -> StrandsPlugin:
-    return StrandsPlugin(models={"concierge": lambda: MockModel(concierge_script)})
+@pytest.fixture(autouse=True)
+def reset_calls():
+    CALLS.clear()
+
+
+def connect(env: WorkflowEnvironment, concierge: list, specialist: list | None = None) -> tuple[Client, StrandsPlugin]:
+    """A client whose plugin plays scripted models: one script for the concierge, one shared by the specialists."""
+    plugin = StrandsPlugin(models={"concierge": lambda: MockModel(concierge),
+                                   "specialist": lambda: MockModel(specialist or [])})
+    return Client(**{**env.client.config(), "plugins": [plugin]}), plugin
+
+
+def worker(client: Client) -> Worker:
+    return Worker(client, task_queue=TASK_QUEUE, workflows=[ConciergeWorkflow], activities=MOCK_ACTIVITIES)
 
 
 async def chat(client: Client, conv_id: str, text: str):
@@ -34,31 +96,34 @@ async def chat(client: Client, conv_id: str, text: str):
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
         task_queue=TASK_QUEUE,
     )
-    reply = await client.execute_update_with_start_workflow(
+    response = await client.execute_update_with_start_workflow(
         ConciergeWorkflow.chat, ChatRequest(text=text), start_workflow_operation=start
     )
-    return reply, await start.workflow_handle()
+    return response, await start.workflow_handle()
+
+
+async def scheduled(handle: WorkflowHandle) -> Counter:
+    """Activity type -> how many times the workflow scheduled it."""
+    history = await handle.fetch_history()
+    return Counter(
+        e.activity_task_scheduled_event_attributes.activity_type.name
+        for e in history.events
+        if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    )
 
 
 async def test_chat_is_a_durable_update(env: WorkflowEnvironment):
-    plugin = plugin_for(["Lisbon in March is lovely. How many travelers?", "Two travelers, noted."])
-    client = Client(**{**env.client.config(), "plugins": [plugin]})
+    client, plugin = connect(env, [reply("Lisbon in March is lovely. Where are you flying from?"),
+                                   reply("New York, noted.")])
     conv_id = f"concierge-{uuid.uuid4()}"
-    async with Worker(client, task_queue=TASK_QUEUE, workflows=[ConciergeWorkflow]):
+    async with worker(client):
         first, h1 = await chat(client, conv_id, "Plan a four-day trip to Lisbon in March")
-        second, h2 = await chat(client, conv_id, "Two of us")
+        second, h2 = await chat(client, conv_id, "From New York")
         assert h1.first_execution_run_id == h2.first_execution_run_id  # same conversation, same run
-        assert first.message == "Lisbon in March is lovely. How many travelers?"
-        assert second.message == "Two travelers, noted."
+        assert first.message == "Lisbon in March is lovely. Where are you flying from?"
+        assert second.message == "New York, noted."
         assert (await h1.query(ConciergeWorkflow.state)).turns == 2
-
-        history = await h1.fetch_history()
-        model_calls = [
-            e for e in history.events
-            if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
-            and e.activity_task_scheduled_event_attributes.activity_type.name == "invoke_model"
-        ]
-        assert len(model_calls) == 2
+        assert (await scheduled(h1))["invoke_model"] == 2
         await h1.signal(ConciergeWorkflow.end_chat)
         await h1.result()
 
@@ -66,9 +131,9 @@ async def test_chat_is_a_durable_update(env: WorkflowEnvironment):
 
 
 async def test_chat_validator(env: WorkflowEnvironment):
-    client = Client(**{**env.client.config(), "plugins": [plugin_for(["Hello! Where would you like to go?"])]})
+    client, _ = connect(env, [reply("Hello! Where would you like to go?")])
     conv_id = f"concierge-{uuid.uuid4()}"
-    async with Worker(client, task_queue=TASK_QUEUE, workflows=[ConciergeWorkflow]):
+    async with worker(client):
         await chat(client, conv_id, "hi")
         handle = client.get_workflow_handle_for(ConciergeWorkflow.run, conv_id)
         with pytest.raises(WorkflowUpdateFailedError) as rejected:
@@ -81,3 +146,69 @@ async def test_chat_validator(env: WorkflowEnvironment):
 
         await handle.signal(ConciergeWorkflow.end_chat)
         await handle.result()  # end_chat completes the conversation
+
+
+async def test_agents_as_tools_wiring(env: WorkflowEnvironment):
+    concierge = [{"name": "flight_agent", "input": {"input": "JFK to Lisbon, 2027-03-10 to 2027-03-13, 1 adult"}},
+                 reply("Duffel Airways has a fare for 412.30 USD.")]
+    specialist = [{"name": "search_flights", "input": {"origin": "JFK", "destination": "Lisbon",
+                                                       "depart_date": "2027-03-10", "return_date": "2027-03-13"}},
+                  '[{"offer_id": "off_fake_zz", "total_amount": "412.30", "currency": "USD"}]']
+    client, plugin = connect(env, concierge, specialist)
+    conv_id = f"concierge-{uuid.uuid4()}"
+    async with worker(client):
+        response, handle = await chat(client, conv_id, "Flights from JFK to Lisbon in March")
+        assert response.message == "Duffel Airways has a fare for 412.30 USD."
+        # concierge -> flight_agent (a sub-agent) -> search_flights (an activity) -> back to the concierge
+        assert await scheduled(handle) == Counter({"invoke_model": 4, "search_flights": 1})
+        assert CALLS == Counter({"search_flights": 1})
+        await handle.signal(ConciergeWorkflow.end_chat)
+        await handle.result()
+
+    await Replayer(workflows=[ConciergeWorkflow], plugins=[plugin]).replay_workflow(await handle.fetch_history())
+
+
+# One scripted search round: the concierge asks each specialist, and each answers with the IDs it "found".
+SEARCHES = [{"name": "flight_agent", "input": {"input": "JFK to Lisbon, 2027-03-10 to 2027-03-13"}},
+            {"name": "hotel_agent", "input": {"input": "Lisbon, 2027-03-10 to 2027-03-13"}},
+            {"name": "itinerary_agent", "input": {"input": "Lisbon, museums and fado"}}]
+FOUND = ['[{"offer_id": "off_fake_zz"}]', '[{"rate_id": "rat_fake_1"}]',
+         '{"places": [{"place_id": "ChIJmuseum"}, {"place_id": "ChIJfado"}]}']
+
+
+async def test_proposal_is_priced_by_activity(env: WorkflowEnvironment):
+    client, _ = connect(env, [*SEARCHES, reply("Here is your Lisbon trip.", PROPOSAL)], FOUND)
+    conv_id = f"concierge-{uuid.uuid4()}"
+    async with worker(client):
+        response, handle = await chat(client, conv_id, "Plan a four-day trip from New York to Lisbon in March")
+        quote = response.quote
+        assert quote is not None and quote.quote_id == "q1"
+        assert quote.totals == {"USD": Decimal("950.30")}  # every amount comes from price_quote, none from the model
+        assert [i.amount for i in quote.line_items] == [PRICES[i] for i in
+                                                        ("off_fake_zz", "rat_fake_1", "ChIJmuseum", "ChIJfado")]
+        assert quote.over_budget is False
+        assert quote.travellers == ["Ada Lovelace"]
+        assert [i.mock for i in quote.line_items] == [False, False, True, True]
+        assert response.status == "chatting"  # quotes are not approvable until v4
+        assert CALLS == Counter({"price_quote": 1})
+        await handle.signal(ConciergeWorkflow.end_chat)
+        await handle.result()
+
+
+async def test_invented_ids_are_rejected(env: WorkflowEnvironment):
+    concierge = [reply("Here is your Lisbon trip.", PROPOSAL),  # proposes without searching: every ID is invented
+                 reply("Sorry, let me search properly.")]
+    model = MockModel(concierge)
+    client = Client(**{**env.client.config(), "plugins": [StrandsPlugin(models={"concierge": lambda: model})]})
+    conv_id = f"concierge-{uuid.uuid4()}"
+    async with worker(client):
+        response, handle = await chat(client, conv_id, "Plan a trip to Lisbon in March")
+        assert response.quote is None
+        assert "off_fake_zz was not returned by any search" in response.message
+        assert CALLS["price_quote"] == 0  # never priced
+        await chat(client, conv_id, "ok")  # the concierge is told on its next turn
+        last_user_text = model.seen[-1][-1]["content"][0]["text"]
+        assert last_user_text.startswith("[system: price_quote rejected the proposal: off_fake_zz was not returned")
+        assert (await scheduled(handle))["price_quote"] == 0
+        await handle.signal(ConciergeWorkflow.end_chat)
+        await handle.result()
