@@ -55,10 +55,17 @@ need no AWS credentials: `uv run pytest -q`.
 
 ## Walkthrough
 
-The repository is built one capability at a time. Each tag below runs and passes its tests;
-`git diff <previous-tag>..<tag>` shows exactly what that step added.
+The repository is built one capability at a time. Each step is a tag with a
+[GitHub Release](https://github.com/ddn4/agentcore-travel-demo/releases) that explains it and links the step's diff.
+From `v2-agents-as-tools` on, each step also lands through a pull request that holds its review.
+Every tag runs and passes its tests. To follow along:
+
+```bash
+git checkout v1-durable-chat            # any tag below
+git diff v0-spec..v1-durable-chat       # what that step added (or use the Release's compare link)
+```
 
 | Tag | What you see | Command |
 |---|---|---|
-| `v0-spec` | the spec and a toolchain that installs | `uv sync` |
-| `v1-durable-chat` | a chat reply that survives a worker restart; `invoke_model` activities in the UI | `uv run python -m travel.worker` · `uv run python chat.py` |
+| [`v0-spec`](https://github.com/ddn4/agentcore-travel-demo/releases/tag/v0-spec) | the spec and a toolchain that installs | `uv sync` |
+| [`v1-durable-chat`](https://github.com/ddn4/agentcore-travel-demo/releases/tag/v1-durable-chat) | a chat reply that survives a worker restart; `invoke_model` activities in the UI | `uv run python -m travel.worker` · `uv run python chat.py` |

@@ -1974,6 +1974,13 @@ The repo is built as ten **annotated git tags**. Each tag adds one capability to
   done; git checkout -q main
   ```
 
+- **GitHub workflow, one step at a time:**
+  1. Build the step on a branch named after its tag, e.g. `step/v2-agents-as-tools`, cut from `main`.
+  2. Push the branch and open a PR into `main`. The PR description is the step's narrative: what it adds, why, how to run it, and what to look at in the Temporal Web UI. Review happens here; fixes are folded into the step's own commits before landing.
+  3. Land it by **fast-forwarding** `main` to the branch (`git push origin step/<tag>:main`), so the commits on `main` are exactly the ones reviewed. GitHub marks the PR as merged. The merge buttons are not used, because they would rewrite or squash the commits.
+  4. Tag `main` with the annotated tag, push the tag, and publish a **GitHub Release** for it: the tag message as notes, plus a compare link `compare/<previous-tag>...<tag>`.
+  5. Delete the step branch; the tag, PR and Release remain.
+
 ### 13.2 Tags
 
 **`v0-spec`: the plan**
