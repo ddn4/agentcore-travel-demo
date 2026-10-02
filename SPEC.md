@@ -138,7 +138,8 @@ agentcore-travel-demo/
 └── tests/
     ├── mock_model.py            # scripted strands Model
     ├── fake_duffel.py           # ~40-line httpx.MockTransport fake: offers, orders, cancellations, stays quotes/bookings, place details
-    ├── test_workflow.py         # workflow tests (mocked activities) + ActivityEnvironment tests, no network (§10.4)
+    ├── test_workflow.py         # workflow tests with mocked activities, no network (§10.4)
+    ├── test_activities.py       # the real activities under ActivityEnvironment against fake_duffel, no network
     ├── test_agentcore_shell.py  # 2 tests of the hosting shell (added at v7)
     ├── test_versioning.py       # 1 upgrade-on-CAN test with two build ids on the dev server (added at v8)
     └── test_live.py             # 1 opt-in smoke test (pytest -m live)
@@ -881,6 +882,7 @@ async def price_quote(req: PriceRequest) -> PricedTrip:
 - **Mock activities never change price**, so they never trip the re-check.
 - **Spent offers.** Duffel allows one order per offer request (VERIFIED), and a re-plan after compensation could otherwise reuse a spent `off_` that `GET /air/offers/{id}` still returns. The `orders_for_offer` check turns that into a chat note instead of a doomed booking.
 - **Expiry.** `expires_at` is the flight offer's. Stays quotes have none (VERIFIED), and the rate's `expires_at` is not re-read here; a stale rate shows up as a failed `POST /stays/quotes` instead.
+- **Invented IDs never reach `price_quote`.** Before pricing, workflow code checks that every proposed ID appears in a tool result the concierge received this conversation (`_invented_ids`, deterministic: it reads only `messages`). An ID the model made up is reported as a problem ("… was not returned by any search") and the concierge is told on its next turn. Added at v2 after a run against Claude on Bedrock proposed a plausible but unreturned Google place ID.
 - **Bad IDs are data.** An unknown or mistyped place, offer or rate id is a non-retryable 4xx, which becomes a `problems` entry, so the turn stays in `chatting` (§4.3) instead of failing with `TurnFailed`. Only a `Config` error (wrong token) fails the turn.
 
 **`travel/duffel.py` (thin client, ~90 lines)**
@@ -1704,7 +1706,7 @@ Per decision 9, workflow tests **mock the provider activities**. Each mock is an
 - The **real** `book_activities`, `cancel_activities`, `charge_payment` and `refund_payment` are registered as-is, because they are mocks with no network.
 
 ### 10.3 `tests/fake_duffel.py` (no network; ~40 lines)
-Only for the two `ActivityEnvironment` tests that exercise the real `travel/duffel.py` and `price_quote`.
+Only for the `ActivityEnvironment` tests in `tests/test_activities.py`, which exercise the real `travel/duffel.py` and `price_quote`.
 - `FakeDuffel.handle(request) -> httpx.Response` routes:
   - v2: `GET /air/offers/{id}`, `POST /stays/quotes`, Google `GET places/{id}` (an unknown id returns 404);
   - v5 adds: `GET /air/orders?offer_id=`, `POST /air/orders`, `GET /air/orders/{id}`, `POST /air/order_cancellations` and `…/actions/confirm`, single-use offers;
@@ -1729,9 +1731,10 @@ Each test is added at the tag named in its row and only uses features that exist
 |---|---|---|---|
 | v1 | `test_chat_is_a_durable_update` | two `chat` Update-with-Starts on one id; then `Replayer` on the history | same run; two replies from the scripted concierge; `state().turns == 2`; history has `invoke_model` × 2; replay passes |
 | v1 | `test_chat_validator` | one message; then whitespace-only text; then `end_chat` | the empty message is rejected by the validator and leaves no `UpdateAccepted` event in history; `end_chat` completes the workflow |
-| v2 | `test_agents_as_tools_wiring` | concierge calls `flight_agent` → specialist calls `search_flights` → specialist text → concierge `ConciergeReply` | history has `invoke_model` × 4, `search_flights` × 1, `price_quote` × 1 |
+| v2 | `test_agents_as_tools_wiring` | concierge calls `flight_agent` → specialist calls `search_flights` → specialist text → concierge `ConciergeReply` (no proposal) | history has exactly `invoke_model` × 4 and `search_flights` × 1; replay passes |
 | v2 | `test_proposal_is_priced_by_activity` | one concierge turn with `PROPOSAL` | `quote.totals == {"USD": Decimal("950.30")}`, `over_budget is False`, `travellers == ["Ada Lovelace"]`, two activity line items `mock=True`; every amount equals `PRICES`, none comes from the model |
-| v2 | `test_price_quote_problems` (ActivityEnvironment + `FakeDuffel`) | real `price_quote` with a good proposal, then an unknown place id. **v4 adds** a changed flight price against `expected`; **v5 adds** an offer that already has a cancelled order | first returns `problems == []` and the 950.30 USD total; then "place … unavailable", "price changed" and "already used" respectively, each **without** raising |
+| v2 | `test_invented_ids_are_rejected` | the concierge proposes without calling any specialist | no quote, no `price_quote` scheduled; the reply names the unreturned ID; the next turn's prompt starts with `[system: price_quote rejected the proposal:` |
+| v2 | `test_price_quote_problems` (`tests/test_activities.py`: ActivityEnvironment + `FakeDuffel`) | real `price_quote` with a good proposal, then an unknown place id. **v4 adds** a changed flight price against `expected`; **v5 adds** an offer that already has a cancelled order | first returns `problems == []` and the 950.30 USD total; then "place … unavailable", "price changed" and "already used" respectively, each **without** raising |
 | v3 | `test_permission_granted_resumes_turn` | concierge calls `locate_user` (`{"ip": "6.6.6.6"}`); `chat` while pending; `grant_permission(granted, USER_IP)`. Second case: one model message with two `locate_user` toolUses | 1st reply has `permission_request` (id starts `v1:before_tool_call:t`), no `locate_user` scheduled; the pending `chat` is rejected; the grant reply is the finished turn; mock `locate_user` got `[USER_IP]`; `state()` contains no IP; the IP is in no `invoke_model` input (`model.seen`). Two-call case: one prompt, `interrupt_ids` has 2 ids, both calls run with `USER_IP` |
 | v3 | `test_permission_denied_asks_for_city` | as above, then `grant_permission(denied)`; a later turn calls `locate_user` again | no `locate_user` scheduled, ever; `model.seen` has an error tool result containing `DENIED_MSG`; the later turn gets no `permission_request` |
 | v3 | `test_permission_asked_once` | grant; a later turn calls `locate_user`; `set_permission(undecided)`; a later call | the 2nd call pauses with `prompt=None` (no question); answering with an IP runs it; after reset the next call prompts again. Validators reject: an answer with nothing pending; a stale `interrupt_id`; `granted` without `client_ip`; `client_ip` with `denied`; `client_ip="10.0.0.1"`; `set_permission` while a request is pending |
@@ -1996,8 +1999,8 @@ The repo is built as ten **annotated git tags**. Each tag adds one capability to
 - Diff shows: `StrandsPlugin` on the client, `TemporalAgent`, and an Update-with-Start chat. No tools yet.
 
 **`v2-agents-as-tools`: specialists, real search and deterministic pricing**
-- Files: `travel/duffel.py` (client, `_req`, `place`, `search_flights`, `get_offer`, `search_stays`, `fetch_rates`, `create_stays_quote`); `travel/activity_provider.py` (`RATE_CARD`, `quote`); `travel/activities.py` (`search_*`, `_google`, `price_quote` without `expected` or the spent check); `travel/agents.py` (four specialists via `as_tool`, `check_budget`/`check_policy`, all §5.3 prompts; the concierge **asks** for the origin, since there is no default airport); `travel/models.py` (`TripProposal`, `ConciergeReply`, `LineItem`, `PriceRequest(proposal)`, `PricedTrip`, `Quote` without `simulate_failure`, `TEST_TRAVELLERS`, `ChatResponse.quote`); `travel/workflow.py` (structured output, `price_quote` after a proposal, `_make_quote`, problem note); `chat.py` (quote display, without "/approve"); `tests/fake_duffel.py` (`GET /air/offers/{id}`, `POST /stays/quotes`, Google `GET places/{id}`); mocked activities; `tests/test_live.py` steps 1–4; README provider accounts.
-- Tests: `test_agents_as_tools_wiring`, `test_proposal_is_priced_by_activity`, `test_price_quote_problems` (good proposal and unknown place).
+- Files: `travel/duffel.py` (client, `_req`, `place`, `search_flights`, `get_offer`, `search_stays`, `fetch_rates`, `create_stays_quote`); `travel/activity_provider.py` (`RATE_CARD`, `quote`); `travel/activities.py` (`search_*`, `_google`, `price_quote` without `expected` or the spent check); `travel/agents.py` (four specialists via `as_tool`, `check_budget`/`check_policy`, all §5.3 prompts; the concierge **asks** for the origin, since there is no default airport); `travel/models.py` (`TripProposal`, `ConciergeReply`, `LineItem`, `PriceRequest(proposal)`, `PricedTrip`, `Quote` without `simulate_failure`, `TEST_TRAVELLERS`, `ChatResponse.quote`); `travel/workflow.py` (structured output, `price_quote` after a proposal, `_make_quote`, problem note); `chat.py` (quote display, without "/approve"); `tests/fake_duffel.py` (`GET /air/offers/{id}`, `POST /stays/quotes`, Google `GET places/{id}`); `tests/test_activities.py`; mocked activities; `tests/test_live.py` steps 1–4; README provider accounts.
+- Tests: `test_agents_as_tools_wiring`, `test_proposal_is_priced_by_activity`, `test_invented_ids_are_rejected`, `test_price_quote_problems` (good proposal and unknown place).
 - Demo: "Plan a four-day trip from New York to Lisbon in March under $3K" → quote `q1` with real offers. The UI shows the agent tree and `price_quote`.
 - Diff shows: agents-as-tools wiring and the "LLM proposes IDs, an activity prices them" rule.
 
