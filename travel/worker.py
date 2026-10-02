@@ -4,6 +4,7 @@ import asyncio
 import os
 from datetime import timedelta
 
+import boto3
 from botocore.config import Config as BotocoreConfig
 from strands.models.bedrock import BedrockModel
 from temporalio.client import Client
@@ -22,10 +23,14 @@ BUILD_ID = os.environ.get("TEMPORAL_BUILD_ID", "local")
 _NO_RETRY = BotocoreConfig(retries={"max_attempts": 0}, read_timeout=120)  # Temporal owns retries
 
 
+def aws_region() -> str:
+    """AWS_REGION, else the region of the active AWS profile, else us-east-1."""
+    return os.environ.get("AWS_REGION") or boto3.Session().region_name or "us-east-1"
+
+
 def bedrock_models() -> dict:
-    region = os.environ.get("AWS_REGION", "us-west-2")
     model_id = os.environ.get("MODEL_ID", "global.anthropic.claude-sonnet-4-6")
-    make = lambda: BedrockModel(model_id=model_id, region_name=region, boto_client_config=_NO_RETRY)  # noqa: E731
+    make = lambda: BedrockModel(model_id=model_id, region_name=aws_region(), boto_client_config=_NO_RETRY)  # noqa: E731
     return {"concierge": make, "specialist": make}  # lazy: only called on the worker, never by chat.py
 
 
