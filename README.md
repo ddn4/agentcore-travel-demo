@@ -45,7 +45,9 @@ The region is `AWS_REGION` if set, else your AWS profile's region, else `us-east
 model with `MODEL_ID` (for example `us.anthropic.claude-sonnet-4-6` where the global profile is blocked).
 
 The worker uses Worker Versioning even locally, for parity with AgentCore; that is why the
-`set-current-version` step exists. After switching tags, start a new conversation: open
+`set-current-version` step exists. If that command fails (for example with a gRPC deadline error right after
+the worker starts), wait a few seconds and run it again. Until it succeeds, chat messages wait
+without a reply; they go through as soon as the version is current. After switching tags, start a new conversation: open
 conversations are pinned to the code that started them.
 
 Tests run against a local dev server that the test fixture starts, with a scripted model, so they
