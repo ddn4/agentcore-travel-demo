@@ -1,12 +1,14 @@
 import asyncio
 import copy
 
-from strands.types.exceptions import EventLoopException
 from temporalio import workflow
 from temporalio.exceptions import ActivityError, ApplicationError
 
-from travel.agents import build_agents
-from travel.models import ChatRequest, ChatResponse, ConciergeInput, ConversationState, Status
+with workflow.unsafe.imports_passed_through():
+    from strands.types.exceptions import EventLoopException, StructuredOutputException
+
+    from travel.agents import build_agents  # imports the activities (httpx); they never run in the sandbox
+    from travel.models import ChatRequest, ChatResponse, ConciergeInput, ConciergeReply, ConversationState, Status
 
 
 @workflow.defn
@@ -32,14 +34,15 @@ class ConciergeWorkflow:
                 raise ApplicationError("conversation closed")
             snapshot = copy.deepcopy(self._concierge.messages)
             try:
-                result = await self._concierge.invoke_async(req.text)
-            except (ActivityError, EventLoopException) as e:
+                result = await self._concierge.invoke_async(req.text, structured_output_model=ConciergeReply)
+                reply: ConciergeReply = result.structured_output or ConciergeReply(message=str(result).strip())
+            except (ActivityError, EventLoopException, StructuredOutputException) as e:
                 if isinstance(e, EventLoopException) and not isinstance(e.original_exception, ActivityError):
-                    raise  # a bug, not a model failure: fail the workflow task so it is visible
+                    raise  # a bug, not a model or provider failure: fail the workflow task so it is visible
                 self._concierge = self._build(snapshot)  # drop the half-finished turn
                 raise ApplicationError(f"concierge turn failed: {e}", type="TurnFailed") from e
             self._turns += 1
-            return ChatResponse(message=str(result).strip(), status=self._status)
+            return ChatResponse(message=reply.message, status=self._status)
 
     @chat.validator
     def _validate_chat(self, req: ChatRequest) -> None:
