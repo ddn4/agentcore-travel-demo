@@ -1443,6 +1443,7 @@ async def answer(pr: PermissionRequest) -> ChatResponse:      # a reply, or stat
 | `/permissions deny` · `/permissions reset` | `set_permission` with `decision="denied"` / `"undecided"` (reset = ask again next time); no IP is sent; rejected while a request is pending |
 | `/status` | `state` Query; on `RPCError` / `WorkflowQueryFailedError` prints the last cached `ChatResponse` and "worker may be scaled to zero; send a message to wake it" |
 | `/quit` | `end_chat` Signal |
+| Ctrl+C | leaves without ending the conversation (it is durable) and prints the `--conversation` command to resume; a message still in flight is processed by the workflow anyway |
 
 - **Display:** If `outcome` is set, print it first. Then print:
   - the message;
